@@ -3,6 +3,7 @@
 ⚡ LIGHTNING VPS ALL-IN-ONE
 ✅ APK secret SAME: RAGEBITE_SECRET_2026_CHANGE_ME
 ✅ DB name: lightning.db
+✅ Both endpoints: /api/slots AND /api/slots/status
 """
 
 import os
@@ -20,11 +21,10 @@ from flask_cors import CORS
 import requests
 
 # ==================== CONFIG ====================
-KEY_BOT_TOKEN = "8823908635:AAHO373_iqEcipIOdhACahEO-3O-ZipA21g"      # @KEY_SWARGBOT
-DD_BOT_TOKEN  = "8650600804:AAFw-AuiLMtbUUHIbqwdPzVeOG8s11yfdA8"      # @test_swarg_bot
+KEY_BOT_TOKEN = "8823908635:AAHO373_iqEcipIOdhACahEO-3O-ZipA21g"
+DD_BOT_TOKEN  = "8650600804:AAFw-AuiLMtbUUHIbqwdPzVeOG8s11yfdA8"
 OWNER_ID = 6321758394
 
-# ✅ APK me wahi secret hai
 API_SECRET = "RAGEBITE_SECRET_2026_CHANGE_ME"
 API_PORT = 5000
 
@@ -255,6 +255,23 @@ def check_auth():
     return request.headers.get('X-API-KEY') == API_SECRET
 
 
+def build_slots_response():
+    """Common slot response builder"""
+    rows = get_all_slots()
+    slots = []
+    for r in rows:
+        if r[8]:
+            try:
+                rem = int((datetime.strptime(r[7], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds())
+            except:
+                rem = 0
+            slots.append({"slot": r[0], "status": "BUSY", "remaining": max(0, rem)})
+        else:
+            slots.append({"slot": r[0], "status": "FREE", "remaining": 0})
+    active = sum(1 for s in slots if s["status"] == "BUSY")
+    return {"slots": slots, "active": active, "max": SLOTS}
+
+
 @app.route('/api/health', methods=['GET'])
 def api_health():
     return jsonify({"status": "OK", "bot": "LIGHTNING"})
@@ -277,21 +294,16 @@ def api_verify():
     return jsonify({"status": "INVALID", "reason": status})
 
 
+# ✅ APK wala endpoint — /api/slots
+@app.route('/api/slots', methods=['GET'])
+def api_slots():
+    return jsonify(build_slots_response())
+
+
+# ✅ Backup endpoint — /api/slots/status
 @app.route('/api/slots/status', methods=['GET'])
 def api_slots_status():
-    rows = get_all_slots()
-    slots = []
-    for r in rows:
-        if r[8]:
-            try:
-                rem = int((datetime.strptime(r[7], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds())
-            except:
-                rem = 0
-            slots.append({"slot": r[0], "status": "BUSY", "remaining": max(0, rem)})
-        else:
-            slots.append({"slot": r[0], "status": "FREE", "remaining": 0})
-    active = sum(1 for s in slots if s["status"] == "BUSY")
-    return jsonify({"slots": slots, "active": active, "max": SLOTS})
+    return jsonify(build_slots_response())
 
 
 @app.route('/api/dd', methods=['POST'])
@@ -495,6 +507,13 @@ def main():
     print(f"🔧 Maintenance: {get_maintenance().upper()}")
     print(f"🤖 Key Bot: @KEY_SWARGBOT")
     print(f"📩 DD Bot: @test_swarg_bot")
+    print("=" * 60)
+    print("📌 Endpoints:")
+    print(f"  GET  /api/health")
+    print(f"  POST /api/verify")
+    print(f"  GET  /api/slots          ← APK uses this")
+    print(f"  GET  /api/slots/status   ← backup")
+    print(f"  POST /api/dd")
     print("=" * 60)
     print("✅ Running...")
     print("=" * 60)
