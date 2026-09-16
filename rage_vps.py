@@ -2,6 +2,7 @@
 """
 ⚡ RAGEBITE VPS ALL-IN-ONE
 ✅ Flask API + Key Bot + Maintenance
+✅ 2 Messages: pehle /bgmi command, phir details (with key)
 """
 
 import os
@@ -26,9 +27,7 @@ OWNER_ID = 6321758394
 API_SECRET = "RAGEBITE_SECRET_2026_CHANGE_ME"
 API_PORT = 5000
 
-APP_IDS = [
-    "com.ragebite.app",
-]
+APP_IDS = ["com.ragebite.app"]
 SLOTS_PER_APP = 4
 
 DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ragebite.db')
@@ -278,7 +277,7 @@ def notify_owner_dd(text):
             f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage",
             json={"chat_id": OWNER_ID, "text": text},
             timeout=5)
-        print(f"📤 DM sent: {text}")
+        print(f"📤 DM sent: {text[:50]}")
     except Exception as e:
         print(f"❌ DM error: {e}")
 
@@ -335,6 +334,26 @@ def api_all_slots():
         active = sum(1 for s in slots if s["status"] == "BUSY")
         result[app_id] = {"slots": slots, "active": active, "max": SLOTS_PER_APP}
     return jsonify(result)
+
+
+@app.route('/api/slots/status/<app_id>', methods=['GET'])
+def api_app_slots(app_id):
+    if app_id not in APP_IDS:
+        return jsonify({"error": "Unknown app", "valid": APP_IDS}), 404
+
+    rows = get_app_slots(app_id)
+    slots = []
+    for r in rows:
+        if r[10]:
+            try:
+                rem = int((datetime.strptime(r[9], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds())
+            except:
+                rem = 0
+            slots.append({"slot": r[0], "status": "BUSY", "remaining": max(0, rem)})
+        else:
+            slots.append({"slot": r[0], "status": "FREE", "remaining": 0})
+    active = sum(1 for s in slots if s["status"] == "BUSY")
+    return jsonify({"app_id": app_id, "slots": slots, "active": active, "max": SLOTS_PER_APP})
 
 
 @app.route('/api/dd', methods=['POST'])
@@ -395,7 +414,22 @@ def api_dd():
         return jsonify({"status": "ERROR", "reason": "SlotsFull",
                         "message": f"App {pkg} ke saare slots busy hain"})
 
+    # ✅ PEHLA MSG — command (bridge forward karega)
     notify_owner_dd(f"/bgmi {ip} {port} {time_sec} {pkg}")
+
+    # ✅ DOOSRA MSG — details (with key)
+    details = (
+        f"🔔 ATTACK REQUEST\n\n"
+        f"🔑 Key: {key}\n"
+        f"📱 Device: {device_id[:20]}...\n"
+        f"🎯 Target: {ip}:{port}\n"
+        f"⏱ Time: {time_sec}s\n"
+        f"📌 Slot: #{slot_id}\n"
+        f"📦 App: {pkg}\n"
+        f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    notify_owner_dd(details)
+
     print(f"✅ Attack request: {ip}:{port} | Slot {slot_id}")
 
     end = datetime.now() + timedelta(seconds=time_sec)
