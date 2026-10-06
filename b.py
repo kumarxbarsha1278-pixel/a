@@ -36,7 +36,7 @@ from flask_cors import CORS
 import requests
 
 # ==================== CONFIG ====================
-KEY_BOT_TOKEN = "8823908635:AAHO373_iqEcipIOdhACahEO-3O-ZipA21g"
+KEY_BOT_TOKEN = "8823908635:AAGZN9cD6feaNAuhF1WwepeZ7Vg1IIQSKGg"
 DD_BOT_TOKEN  = "8650600804:AAFw-AuiLMtbUUHIbqwdPzVeOG8s11yfdA8"
 OWNER_ID = 6321758394
 
