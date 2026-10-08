@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (FINAL)
+⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (PRODUCTION v4)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Per-app slots — STRICT ISOLATION (23 kabhi nahi)
+✅ Per-app slots — STRICT ISOLATION (no mix, no 23 aggregate)
 ✅ Cross-app key block — 3 layer security
-✅ DD bot: 2 alag messages (info + /bgmi command)
-✅ Dynamic apps
-✅ Decimal rates
+✅ DD bot: 2 alag messages (async, non-blocking)
+✅ Connection pool (fast DB)
+✅ Rate/Slots cache (5 sec TTL, multi-worker safe)
+✅ Gunicorn ready (production WSGI)
+✅ Decimal rates, dynamic apps
 ✅ Maintenance freeze (keys + slots)
 ✅ Multi-device keys (1-20)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run: gunicorn -c gunicorn.conf.py lightning:app
 """
 
 import os
 import re
+import queue
 import sqlite3
 import threading
 import time
 import random
 import string
+import concurrent.futures
 from datetime import datetime, timedelta
 
 import telebot
@@ -58,9 +63,13 @@ STATUS_ACTIVE = "ACTIVE"
 STATUS_DELETED = "DELETED"
 STATUS_DISABLED = "DISABLED"
 
+CACHE_TTL = 5        # seconds — safe for multi-worker
+POOL_SIZE = 20
+
 rate_limit_store = {}
 db_write_lock = threading.RLock()
 _cache_lock = threading.RLock()
+_rate_limit_lock = threading.RLock()
 
 apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 10
@@ -68,22 +77,83 @@ apihelper.READ_TIMEOUT = 10
 _apps_cache = {}
 _name_to_pkg_cache = {}
 
+# DD notification thread pool
+_dd_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+# ═══════════════════════ CONNECTION POOL ═══════════════════════
+_conn_pool = queue.Queue(maxsize=POOL_SIZE)
+_pool_init_lock = threading.Lock()
+_pool_initialized = False
+
+
+def _init_pool():
+    global _pool_initialized
+    with _pool_init_lock:
+        if _pool_initialized:
+            return
+        for _ in range(POOL_SIZE):
+            try:
+                conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                _conn_pool.put(conn)
+            except Exception as e:
+                print(f"⚠️ Pool init error: {e}")
+        _pool_initialized = True
+        print(f"✅ Connection pool initialized ({POOL_SIZE} connections)")
+
+
+class PooledConn:
+    """Context manager that borrows a connection from the pool."""
+    def __init__(self):
+        self.conn = None
+        self._from_pool = False
+
+    def __enter__(self):
+        if not _pool_initialized:
+            _init_pool()
+        try:
+            self.conn = _conn_pool.get(timeout=10)
+            self._from_pool = True
+        except queue.Empty:
+            self.conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self._from_pool = False
+        return self.conn
+
+    def __exit__(self, *args):
+        if self.conn:
+            try:
+                if self._from_pool:
+                    _conn_pool.put_nowait(self.conn)
+                else:
+                    self.conn.close()
+            except queue.Full:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+
 
 def get_conn():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+    """Returns a pooled connection context manager."""
+    return PooledConn()
 
 
+# ═══════════════════════ APP CACHE ═══════════════════════
 def reload_apps_cache():
     global _apps_cache, _name_to_pkg_cache
     with _cache_lock:
         conn = get_conn()
         try:
-            c = conn.cursor()
-            c.execute("SELECT package, name, prefix, default_rate, default_slots FROM apps ORDER BY name")
-            rows = c.fetchall()
+            with conn as c:
+                cur = c.cursor()
+                cur.execute("SELECT package, name, prefix, default_rate, default_slots FROM apps ORDER BY name")
+                rows = cur.fetchall()
             new_apps, new_names = {}, {}
             for pkg, name, prefix, rate, slots in rows:
                 new_apps[pkg] = {
@@ -96,7 +166,7 @@ def reload_apps_cache():
             _apps_cache = new_apps
             _name_to_pkg_cache = new_names
         finally:
-            conn.close()
+            pass
 
 
 # ═══════════════════════ HELPERS ═══════════════════════
@@ -179,69 +249,92 @@ def fmt_rate(rate):
     return f"{rate:g}"
 
 
+# ═══════════════════════ RATE/SLOTS CACHE ═══════════════════════
+_rate_cache = {}
+_slots_cache = {}
+_rate_slots_lock = threading.RLock()
+
+
 def get_app_rate(pkg):
+    with _rate_slots_lock:
+        cached = _rate_cache.get(pkg)
+        if cached and (time.time() - cached[1]) < CACHE_TTL:
+            return cached[0]
+
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key=?", (f"rate:{pkg}",))
-        row = c.fetchone()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (f"rate:{pkg}",))
+        row = cur.fetchone()
+
+    rate = _app_default_rate(pkg)
     if row:
         try:
-            return float(row[0])
+            rate = float(row[0])
         except (TypeError, ValueError):
             pass
-    return _app_default_rate(pkg)
+
+    with _rate_slots_lock:
+        _rate_cache[pkg] = (rate, time.time())
+    return rate
 
 
 def set_app_rate(pkg, coins):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                  (f"rate:{pkg}", str(coins)))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (f"rate:{pkg}", str(coins)))
+        c.commit()
+    with _rate_slots_lock:
+        _rate_cache.pop(pkg, None)
 
 
 def get_app_slots(pkg):
+    with _rate_slots_lock:
+        cached = _slots_cache.get(pkg)
+        if cached and (time.time() - cached[1]) < CACHE_TTL:
+            return cached[0]
+
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key=?", (f"slots:{pkg}",))
-        row = c.fetchone()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (f"slots:{pkg}",))
+        row = cur.fetchone()
+
+    slots = _app_default_slots(pkg)
     if row:
         try:
-            return max(1, int(row[0]))
+            slots = max(1, int(row[0]))
         except (TypeError, ValueError):
             pass
-    return _app_default_slots(pkg)
+
+    with _rate_slots_lock:
+        _slots_cache[pkg] = (slots, time.time())
+    return slots
 
 
 def set_app_slots(pkg, count):
     count = max(1, min(50, int(count)))
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                  (f"slots:{pkg}", str(count)))
-        c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (f"slots:{pkg}", str(count)))
+        cur.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                      time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0
                      WHERE app_id=? AND slot_id > ? AND is_active=1''', (pkg, count))
-        c.execute("DELETE FROM slots WHERE app_id=? AND slot_id > ?", (pkg, count))
-        c.execute("SELECT slot_id FROM slots WHERE app_id=? ORDER BY slot_id", (pkg,))
-        existing = {r[0] for r in c.fetchall()}
+        cur.execute("DELETE FROM slots WHERE app_id=? AND slot_id > ?", (pkg, count))
+        cur.execute("SELECT slot_id FROM slots WHERE app_id=? ORDER BY slot_id", (pkg,))
+        existing = {r[0] for r in cur.fetchall()}
         for i in range(1, count + 1):
             if i not in existing:
-                c.execute("INSERT OR IGNORE INTO slots (app_id, slot_id, is_active) VALUES (?, ?, 0)",
-                          (pkg, i))
-        conn.commit()
-    finally:
-        conn.close()
+                cur.execute("INSERT OR IGNORE INTO slots (app_id, slot_id, is_active) VALUES (?, ?, 0)",
+                            (pkg, i))
+        c.commit()
+
+    with _rate_slots_lock:
+        _slots_cache[pkg] = (count, time.time())
     return count
 
 
@@ -316,46 +409,47 @@ def validate_prefix(prefix):
 
 def add_app_to_db(pkg, name, prefix, rate=10.0, slots=4):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("INSERT INTO apps (package, name, prefix, default_rate, default_slots, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                  (pkg, name, prefix, float(rate), int(slots), datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                  (f"rate:{pkg}", str(rate)))
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                  (f"slots:{pkg}", str(slots)))
-        for i in range(1, int(slots) + 1):
-            c.execute("INSERT OR IGNORE INTO slots (app_id, slot_id, is_active) VALUES (?, ?, 0)",
-                      (pkg, i))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("INSERT INTO apps (package, name, prefix, default_rate, default_slots, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (pkg, name, prefix, float(rate), int(slots), datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (f"rate:{pkg}", str(rate)))
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (f"slots:{pkg}", str(slots)))
+            for i in range(1, int(slots) + 1):
+                cur.execute("INSERT OR IGNORE INTO slots (app_id, slot_id, is_active) VALUES (?, ?, 0)",
+                            (pkg, i))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
     reload_apps_cache()
 
 
 def remove_app_from_db(pkg):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("DELETE FROM key_devices WHERE key IN (SELECT key FROM keys WHERE app_id=?)", (pkg,))
-        c.execute("DELETE FROM keys WHERE app_id=?", (pkg,))
-        c.execute("DELETE FROM slots WHERE app_id=?", (pkg,))
-        c.execute("DELETE FROM admins WHERE app_id=?", (pkg,))
-        c.execute("DELETE FROM resellers WHERE app_id=?", (pkg,))
-        c.execute("DELETE FROM settings WHERE key=? OR key=?", (f"rate:{pkg}", f"slots:{pkg}"))
-        c.execute("DELETE FROM apps WHERE package=?", (pkg,))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("DELETE FROM key_devices WHERE key IN (SELECT key FROM keys WHERE app_id=?)", (pkg,))
+            cur.execute("DELETE FROM keys WHERE app_id=?", (pkg,))
+            cur.execute("DELETE FROM slots WHERE app_id=?", (pkg,))
+            cur.execute("DELETE FROM admins WHERE app_id=?", (pkg,))
+            cur.execute("DELETE FROM resellers WHERE app_id=?", (pkg,))
+            cur.execute("DELETE FROM settings WHERE key=? OR key=?", (f"rate:{pkg}", f"slots:{pkg}"))
+            cur.execute("DELETE FROM apps WHERE package=?", (pkg,))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
     reload_apps_cache()
+    with _rate_slots_lock:
+        _rate_cache.pop(pkg, None)
+        _slots_cache.pop(pkg, None)
 
 
 def list_all_apps():
@@ -367,140 +461,142 @@ def app_list_str():
     return " · ".join(info["name"] for _, info in list_all_apps())
 
 
-# ═══════════════════════ DATABASE ═══════════════════════
+# ═══════════════════════ DATABASE INIT ═══════════════════════
 def init_db():
+    _init_pool()
+
     conn = get_conn()
-    c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
 
-    c.execute('''CREATE TABLE IF NOT EXISTS apps (
-        package TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        prefix TEXT NOT NULL,
-        default_rate REAL DEFAULT 10,
-        default_slots INTEGER DEFAULT 4,
-        created_at TEXT
-    )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS apps (
+            package TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            prefix TEXT NOT NULL,
+            default_rate REAL DEFAULT 10,
+            default_slots INTEGER DEFAULT 4,
+            created_at TEXT
+        )''')
 
-    c.execute('''CREATE TABLE IF NOT EXISTS keys (
-        key TEXT PRIMARY KEY,
-        device_id TEXT,
-        expiry TEXT,
-        status TEXT DEFAULT 'ACTIVE',
-        slot_count INTEGER DEFAULT 4,
-        max_devices INTEGER DEFAULT 1,
-        app_id TEXT,
-        generated_by TEXT,
-        created_at TEXT
-    )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS keys (
+            key TEXT PRIMARY KEY,
+            device_id TEXT,
+            expiry TEXT,
+            status TEXT DEFAULT 'ACTIVE',
+            slot_count INTEGER DEFAULT 4,
+            max_devices INTEGER DEFAULT 1,
+            app_id TEXT,
+            generated_by TEXT,
+            created_at TEXT
+        )''')
 
-    c.execute('''CREATE TABLE IF NOT EXISTS key_devices (
-        key TEXT,
-        device_id TEXT,
-        bound_at TEXT,
-        PRIMARY KEY (key, device_id)
-    )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS key_devices (
+            key TEXT,
+            device_id TEXT,
+            bound_at TEXT,
+            PRIMARY KEY (key, device_id)
+        )''')
 
-    c.execute('''CREATE TABLE IF NOT EXISTS slots (
-        app_id TEXT,
-        slot_id INTEGER,
-        key TEXT,
-        device_id TEXT,
-        ip TEXT,
-        port TEXT,
-        time_sec INTEGER,
-        start_time TEXT,
-        end_time TEXT,
-        is_active INTEGER DEFAULT 0,
-        PRIMARY KEY (app_id, slot_id)
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS admins (
-        telegram_id TEXT,
-        app_id TEXT,
-        added_at TEXT,
-        PRIMARY KEY (telegram_id, app_id)
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS resellers (
-        telegram_id TEXT,
-        app_id TEXT,
-        balance INTEGER DEFAULT 0,
-        added_at TEXT,
-        PRIMARY KEY (telegram_id, app_id)
-    )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_perms (
-        telegram_id TEXT PRIMARY KEY,
-        can_add_admin INTEGER DEFAULT 0
-    )''')
-
-    c.execute("PRAGMA table_info(keys)")
-    key_cols = [r[1] for r in c.fetchall()]
-    if 'max_devices' not in key_cols:
-        try:
-            c.execute("ALTER TABLE keys ADD COLUMN max_devices INTEGER DEFAULT 1")
-        except sqlite3.OperationalError:
-            pass
-
-    c.execute("PRAGMA table_info(slots)")
-    cols = [r[1] for r in c.fetchall()]
-    if 'app_id' not in cols:
-        print("🔄 Migrating slots table...")
-        c.execute("DROP TABLE IF EXISTS slots")
-        c.execute('''CREATE TABLE slots (
-            app_id TEXT, slot_id INTEGER, key TEXT, device_id TEXT,
-            ip TEXT, port TEXT, time_sec INTEGER, start_time TEXT,
-            end_time TEXT, is_active INTEGER DEFAULT 0,
+        cur.execute('''CREATE TABLE IF NOT EXISTS slots (
+            app_id TEXT,
+            slot_id INTEGER,
+            key TEXT,
+            device_id TEXT,
+            ip TEXT,
+            port TEXT,
+            time_sec INTEGER,
+            start_time TEXT,
+            end_time TEXT,
+            is_active INTEGER DEFAULT 0,
             PRIMARY KEY (app_id, slot_id)
         )''')
 
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', 'off')")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance_started_at', '')")
+        cur.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
 
-    c.execute("SELECT COUNT(*) FROM apps")
-    if c.fetchone()[0] == 0:
-        print("🌱 Seeding default apps...")
-        for pkg, info in _DEFAULT_APPS.items():
-            c.execute("INSERT OR IGNORE INTO apps (package, name, prefix, default_rate, default_slots, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                      (pkg, info["name"], info["prefix"],
-                       float(info.get("default_rate", 10)),
-                       int(info.get("default_slots", 4)),
-                       datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        cur.execute('''CREATE TABLE IF NOT EXISTS admins (
+            telegram_id TEXT,
+            app_id TEXT,
+            added_at TEXT,
+            PRIMARY KEY (telegram_id, app_id)
+        )''')
 
-    c.execute("SELECT package, default_rate, default_slots FROM apps")
-    for pkg, rate, slots in c.fetchall():
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                  (f"rate:{pkg}", str(rate)))
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                  (f"slots:{pkg}", str(slots)))
+        cur.execute('''CREATE TABLE IF NOT EXISTS resellers (
+            telegram_id TEXT,
+            app_id TEXT,
+            balance INTEGER DEFAULT 0,
+            added_at TEXT,
+            PRIMARY KEY (telegram_id, app_id)
+        )''')
 
-    c.execute("SELECT key, app_id FROM keys")
-    bad_keys = []
-    for k, aid in c.fetchall():
-        if not aid:
-            bad_keys.append(k)
-            continue
-        c.execute("SELECT prefix FROM apps WHERE package=?", (aid,))
-        row = c.fetchone()
-        if not row:
-            bad_keys.append(k)
-            continue
-        expected_prefix = row[0]
-        if expected_prefix and not k.startswith(expected_prefix + "-"):
-            bad_keys.append(k)
-    if bad_keys:
-        for k in bad_keys:
-            c.execute("DELETE FROM key_devices WHERE key=?", (k,))
-            c.execute("DELETE FROM keys WHERE key=?", (k,))
-        print(f"🗑️ Cleaned {len(bad_keys)} invalid keys")
+        cur.execute('''CREATE TABLE IF NOT EXISTS admin_perms (
+            telegram_id TEXT PRIMARY KEY,
+            can_add_admin INTEGER DEFAULT 0
+        )''')
 
-    conn.commit()
-    conn.close()
+        cur.execute("PRAGMA table_info(keys)")
+        key_cols = [r[1] for r in cur.fetchall()]
+        if 'max_devices' not in key_cols:
+            try:
+                cur.execute("ALTER TABLE keys ADD COLUMN max_devices INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+
+        cur.execute("PRAGMA table_info(slots)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'app_id' not in cols:
+            print("🔄 Migrating slots table...")
+            cur.execute("DROP TABLE IF EXISTS slots")
+            cur.execute('''CREATE TABLE slots (
+                app_id TEXT, slot_id INTEGER, key TEXT, device_id TEXT,
+                ip TEXT, port TEXT, time_sec INTEGER, start_time TEXT,
+                end_time TEXT, is_active INTEGER DEFAULT 0,
+                PRIMARY KEY (app_id, slot_id)
+            )''')
+
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', 'off')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance_started_at', '')")
+
+        cur.execute("SELECT COUNT(*) FROM apps")
+        if cur.fetchone()[0] == 0:
+            print("🌱 Seeding default apps...")
+            for pkg, info in _DEFAULT_APPS.items():
+                cur.execute("INSERT OR IGNORE INTO apps (package, name, prefix, default_rate, default_slots, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pkg, info["name"], info["prefix"],
+                             float(info.get("default_rate", 10)),
+                             int(info.get("default_slots", 4)),
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+        cur.execute("SELECT package, default_rate, default_slots FROM apps")
+        for pkg, rate, slots in cur.fetchall():
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                        (f"rate:{pkg}", str(rate)))
+            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                        (f"slots:{pkg}", str(slots)))
+
+        cur.execute("SELECT key, app_id FROM keys")
+        bad_keys = []
+        for k, aid in cur.fetchall():
+            if not aid:
+                bad_keys.append(k)
+                continue
+            cur.execute("SELECT prefix FROM apps WHERE package=?", (aid,))
+            row = cur.fetchone()
+            if not row:
+                bad_keys.append(k)
+                continue
+            expected_prefix = row[0]
+            if expected_prefix and not k.startswith(expected_prefix + "-"):
+                bad_keys.append(k)
+        if bad_keys:
+            for k in bad_keys:
+                cur.execute("DELETE FROM key_devices WHERE key=?", (k,))
+                cur.execute("DELETE FROM keys WHERE key=?", (k,))
+            print(f"🗑️ Cleaned {len(bad_keys)} invalid keys")
+
+        c.commit()
 
     reload_apps_cache()
 
@@ -513,23 +609,19 @@ def init_db():
 
 def get_setting(key, default=""):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key=?", (key,))
-        row = c.fetchone()
-        return row[0] if row else default
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+    return row[0] if row else default
 
 
 def set_setting(key, value):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        c.commit()
 
 
 def get_maintenance():
@@ -567,28 +659,26 @@ def set_maintenance(value):
 def extend_active_slots(seconds):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute("SELECT app_id, slot_id, end_time FROM slots WHERE is_active=1")
-            rows = c.fetchall()
+        with conn as c:
+            cur = c.cursor()
+            cur.execute("SELECT app_id, slot_id, end_time FROM slots WHERE is_active=1")
+            rows = cur.fetchall()
             for app_id, slot_id, end_str in rows:
                 try:
                     end = datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
                     new_end = end + timedelta(seconds=seconds)
-                    c.execute("UPDATE slots SET end_time=? WHERE app_id=? AND slot_id=?",
-                              (new_end.strftime('%Y-%m-%d %H:%M:%S'), app_id, slot_id))
+                    cur.execute("UPDATE slots SET end_time=? WHERE app_id=? AND slot_id=?",
+                                (new_end.strftime('%Y-%m-%d %H:%M:%S'), app_id, slot_id))
                 except (ValueError, TypeError):
                     pass
-            conn.commit()
-        finally:
-            conn.close()
+            c.commit()
 
 
 def extend_all_keys(seconds, app_id=None, generated_by=None):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
+        with conn as c:
+            cur = c.cursor()
             query = "SELECT key, expiry FROM keys WHERE status=? "
             params = [STATUS_ACTIVE]
             if app_id:
@@ -598,58 +688,51 @@ def extend_all_keys(seconds, app_id=None, generated_by=None):
                 query += "AND generated_by=? "
                 params.append(str(generated_by))
 
-            c.execute(query, params)
-            rows = c.fetchall()
+            cur.execute(query, params)
+            rows = cur.fetchall()
             count = 0
+            now = datetime.now()
             for key, expiry_str in rows:
                 try:
                     expiry = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
-                    if expiry < datetime.now():
+                    if expiry < now:
                         continue
                     new_expiry = expiry + timedelta(seconds=seconds)
-                    c.execute("UPDATE keys SET expiry=? WHERE key=?",
-                              (new_expiry.strftime('%Y-%m-%d %H:%M:%S'), key))
+                    cur.execute("UPDATE keys SET expiry=? WHERE key=?",
+                                (new_expiry.strftime('%Y-%m-%d %H:%M:%S'), key))
                     count += 1
                 except (ValueError, TypeError):
                     pass
-            conn.commit()
+            c.commit()
             return count
-        finally:
-            conn.close()
 
 
 # ═══════════════════════ ADMIN ═══════════════════════
 def add_admin(telegram_id, app_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO admins (telegram_id, app_id, added_at) VALUES (?, ?, ?)',
-                  (str(telegram_id), app_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('INSERT OR IGNORE INTO admins (telegram_id, app_id, added_at) VALUES (?, ?, ?)',
+                    (str(telegram_id), app_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        c.commit()
 
 
 def remove_admin(telegram_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('DELETE FROM admin_perms WHERE telegram_id=?', (str(telegram_id),))
-        c.execute('DELETE FROM admins WHERE telegram_id=?', (str(telegram_id),))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('DELETE FROM admin_perms WHERE telegram_id=?', (str(telegram_id),))
+        cur.execute('DELETE FROM admins WHERE telegram_id=?', (str(telegram_id),))
+        c.commit()
 
 
 def get_admin_app(telegram_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT app_id FROM admins WHERE telegram_id=? LIMIT 1', (str(telegram_id),))
-        row = c.fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT app_id FROM admins WHERE telegram_id=? LIMIT 1', (str(telegram_id),))
+        row = cur.fetchone()
+    return row[0] if row else None
 
 
 def is_admin(telegram_id):
@@ -658,67 +741,55 @@ def is_admin(telegram_id):
 
 def list_admins():
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT telegram_id, app_id FROM admins ORDER BY app_id')
-        return c.fetchall()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT telegram_id, app_id FROM admins ORDER BY app_id')
+        return cur.fetchall()
 
 
 def can_admin_add_admin(telegram_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT can_add_admin FROM admin_perms WHERE telegram_id=?", (str(telegram_id),))
-        row = c.fetchone()
-        return bool(row and row[0] == 1)
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("SELECT can_add_admin FROM admin_perms WHERE telegram_id=?", (str(telegram_id),))
+        row = cur.fetchone()
+    return bool(row and row[0] == 1)
 
 
 def set_admin_add_permission(telegram_id, value):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO admin_perms (telegram_id, can_add_admin) VALUES (?, ?)",
-                  (str(telegram_id), 1 if value else 0))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("INSERT OR REPLACE INTO admin_perms (telegram_id, can_add_admin) VALUES (?, ?)",
+                    (str(telegram_id), 1 if value else 0))
+        c.commit()
 
 
 # ═══════════════════════ RESELLER ═══════════════════════
 def add_reseller(telegram_id, app_id, balance=0):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO resellers (telegram_id, app_id, balance, added_at) VALUES (?, ?, ?, ?)',
-                  (str(telegram_id), app_id, balance, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('INSERT OR IGNORE INTO resellers (telegram_id, app_id, balance, added_at) VALUES (?, ?, ?, ?)',
+                    (str(telegram_id), app_id, balance, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        c.commit()
 
 
 def remove_reseller(telegram_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('DELETE FROM resellers WHERE telegram_id=?', (str(telegram_id),))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('DELETE FROM resellers WHERE telegram_id=?', (str(telegram_id),))
+        c.commit()
 
 
 def get_reseller_app(telegram_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT app_id, balance FROM resellers WHERE telegram_id=? LIMIT 1', (str(telegram_id),))
-        row = c.fetchone()
-        return row if row else (None, 0)
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT app_id, balance FROM resellers WHERE telegram_id=? LIMIT 1', (str(telegram_id),))
+        row = cur.fetchone()
+    return row if row else (None, 0)
 
 
 def is_reseller(telegram_id):
@@ -727,24 +798,20 @@ def is_reseller(telegram_id):
 
 def get_reseller_balance(telegram_id, app_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT balance FROM resellers WHERE telegram_id=? AND app_id=?', (str(telegram_id), app_id))
-        row = c.fetchone()
-        return row[0] if row else 0
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT balance FROM resellers WHERE telegram_id=? AND app_id=?', (str(telegram_id), app_id))
+        row = cur.fetchone()
+    return row[0] if row else 0
 
 
 def set_reseller_balance(telegram_id, app_id, amount):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('UPDATE resellers SET balance=? WHERE telegram_id=? AND app_id=?',
-                  (amount, str(telegram_id), app_id))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('UPDATE resellers SET balance=? WHERE telegram_id=? AND app_id=?',
+                    (amount, str(telegram_id), app_id))
+        c.commit()
 
 
 def add_reseller_balance(telegram_id, app_id, amount):
@@ -766,12 +833,10 @@ def deduct_reseller_balance(telegram_id, app_id, amount):
 
 def list_resellers(app_id):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT telegram_id, balance FROM resellers WHERE app_id=? ORDER BY telegram_id', (app_id,))
-        return c.fetchall()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT telegram_id, balance FROM resellers WHERE app_id=? ORDER BY telegram_id', (app_id,))
+        return cur.fetchall()
 
 
 # ═══════════════════════ KEYS ═══════════════════════
@@ -790,47 +855,41 @@ def generate_key(duration_sec, app_id, generated_by, slot_count=None, max_device
     expiry = (datetime.now() + timedelta(seconds=duration_sec)).strftime('%Y-%m-%d %H:%M:%S')
 
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('''INSERT INTO keys (key, device_id, expiry, status, slot_count, max_devices, app_id, generated_by, created_at)
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('''INSERT INTO keys (key, device_id, expiry, status, slot_count, max_devices, app_id, generated_by, created_at)
                      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)''',
-                  (key, expiry, STATUS_ACTIVE, slot_count, max_devices, app_id, str(generated_by),
-                   datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-        conn.commit()
-    finally:
-        conn.close()
+                    (key, expiry, STATUS_ACTIVE, slot_count, max_devices, app_id, str(generated_by),
+                     datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        c.commit()
     return key, expiry, slot_count
 
 
 def delete_key_hard(key):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('DELETE FROM key_devices WHERE key=?', (key,))
-            c.execute('DELETE FROM keys WHERE key=?', (key,))
-            c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
+        with conn as c:
+            cur = c.cursor()
+            cur.execute('DELETE FROM key_devices WHERE key=?', (key,))
+            cur.execute('DELETE FROM keys WHERE key=?', (key,))
+            cur.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                          time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0
                          WHERE key=?''', (key,))
-            conn.commit()
-        finally:
-            conn.close()
+            c.commit()
 
 
 def delete_key_soft(key):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_DELETED, key))
-        conn.commit()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_DELETED, key))
+        c.commit()
 
 
 def list_keys(app_id=None, generated_by=None, limit=20, include_deleted=False):
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         query = 'SELECT key, status, expiry, max_devices FROM keys WHERE 1=1'
         params = []
         if not include_deleted:
@@ -844,30 +903,26 @@ def list_keys(app_id=None, generated_by=None, limit=20, include_deleted=False):
             params.append(str(generated_by))
         query += ' ORDER BY created_at DESC LIMIT ?'
         params.append(limit)
-        c.execute(query, params)
-        return c.fetchall()
-    finally:
-        conn.close()
+        cur.execute(query, params)
+        return cur.fetchall()
 
 
 def get_key_info(key):
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT app_id, generated_by, expiry, status FROM keys WHERE key=?', (key,))
-        return c.fetchone()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('SELECT app_id, generated_by, expiry, status FROM keys WHERE key=?', (key,))
+        return cur.fetchone()
 
 
 def verify_key_with_device(key, device_id, app_id):
     """STRICT: Cross-app block via app_id + prefix check."""
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('SELECT expiry, status, device_id, app_id, max_devices FROM keys WHERE key = ?', (key,))
-            row = c.fetchone()
+        with conn as c:
+            cur = c.cursor()
+            cur.execute('SELECT expiry, status, device_id, app_id, max_devices FROM keys WHERE key = ?', (key,))
+            row = cur.fetchone()
             if not row:
                 return None, "NOT_FOUND", False
             expiry_str, status, existing_device, key_app_id, max_devices = row
@@ -896,48 +951,46 @@ def verify_key_with_device(key, device_id, app_id):
                 return None, "INVALID_EXPIRY", False
 
             if expiry < now:
-                c.execute('DELETE FROM key_devices WHERE key=?', (key,))
-                c.execute('DELETE FROM keys WHERE key=?', (key,))
-                c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
+                cur.execute('DELETE FROM key_devices WHERE key=?', (key,))
+                cur.execute('DELETE FROM keys WHERE key=?', (key,))
+                cur.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                              time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0
                              WHERE key=?''', (key,))
-                conn.commit()
+                c.commit()
                 return None, "EXPIRED", False
 
             max_devices = max_devices or 1
 
-            c.execute('SELECT COUNT(*) FROM key_devices WHERE key=?', (key,))
-            dev_count = c.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM key_devices WHERE key=?', (key,))
+            dev_count = cur.fetchone()[0]
 
             if dev_count == 0:
-                c.execute('INSERT OR IGNORE INTO key_devices (key, device_id, bound_at) VALUES (?, ?, ?)',
-                          (key, device_id, now.strftime('%Y-%m-%d %H:%M:%S')))
-                c.execute('UPDATE keys SET device_id = ? WHERE key = ?', (device_id, key))
-                conn.commit()
+                cur.execute('INSERT OR IGNORE INTO key_devices (key, device_id, bound_at) VALUES (?, ?, ?)',
+                            (key, device_id, now.strftime('%Y-%m-%d %H:%M:%S')))
+                cur.execute('UPDATE keys SET device_id = ? WHERE key = ?', (device_id, key))
+                c.commit()
                 return int(expiry.timestamp() * 1000), "VALID", True
 
-            c.execute('SELECT 1 FROM key_devices WHERE key=? AND device_id=?', (key, device_id))
-            if c.fetchone():
+            cur.execute('SELECT 1 FROM key_devices WHERE key=? AND device_id=?', (key, device_id))
+            if cur.fetchone():
                 return int(expiry.timestamp() * 1000), "VALID", True
 
             if dev_count >= max_devices:
                 return None, "DEVICE_LIMIT_REACHED", False
 
-            c.execute('INSERT OR IGNORE INTO key_devices (key, device_id, bound_at) VALUES (?, ?, ?)',
-                      (key, device_id, now.strftime('%Y-%m-%d %H:%M:%S')))
-            conn.commit()
+            cur.execute('INSERT OR IGNORE INTO key_devices (key, device_id, bound_at) VALUES (?, ?, ?)',
+                        (key, device_id, now.strftime('%Y-%m-%d %H:%M:%S')))
+            c.commit()
             return int(expiry.timestamp() * 1000), "VALID", True
-        finally:
-            conn.close()
 
 
 def reset_key(key):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('SELECT expiry FROM keys WHERE key=?', (key,))
-            row = c.fetchone()
+        with conn as c:
+            cur = c.cursor()
+            cur.execute('SELECT expiry FROM keys WHERE key=?', (key,))
+            row = cur.fetchone()
             if not row:
                 return False
             try:
@@ -946,169 +999,164 @@ def reset_key(key):
                 return False
             if expiry < datetime.now():
                 return False
-            c.execute('UPDATE keys SET device_id=NULL WHERE key=?', (key,))
-            c.execute('DELETE FROM key_devices WHERE key=?', (key,))
-            c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
+            cur.execute('UPDATE keys SET device_id=NULL WHERE key=?', (key,))
+            cur.execute('DELETE FROM key_devices WHERE key=?', (key,))
+            cur.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                          time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0
                          WHERE key=?''', (key,))
-            conn.commit()
+            c.commit()
             return True
-        finally:
-            conn.close()
 
 
 # ═══════════════════════ SLOTS ═══════════════════════
 def allot_slot(device_id, key, ip, port, time_sec, app_id):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
+        with conn as c:
+            cur = c.cursor()
 
-            c.execute('SELECT slot_count FROM keys WHERE key = ?', (key,))
-            row = c.fetchone()
+            cur.execute('SELECT slot_count FROM keys WHERE key = ?', (key,))
+            row = cur.fetchone()
             total_app_slots = get_app_slots(app_id)
             key_slot_count = row[0] if (row and row[0]) else total_app_slots
             key_slot_count = max(1, min(key_slot_count, total_app_slots))
 
-            c.execute('SELECT COUNT(*) FROM slots WHERE app_id=? AND key=? AND is_active=1', (app_id, key))
-            used_by_key = c.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM slots WHERE app_id=? AND key=? AND is_active=1', (app_id, key))
+            used_by_key = cur.fetchone()[0]
             if used_by_key >= key_slot_count:
                 return None, "KEY_SLOTS_FULL"
 
-            c.execute('SELECT slot_id FROM slots WHERE app_id=? AND device_id=? AND is_active=1',
-                      (app_id, device_id))
-            if c.fetchone():
+            cur.execute('SELECT slot_id FROM slots WHERE app_id=? AND device_id=? AND is_active=1',
+                        (app_id, device_id))
+            if cur.fetchone():
                 return None, "ALREADY_ACTIVE"
 
-            c.execute('SELECT slot_id FROM slots WHERE app_id=? AND is_active=0 ORDER BY slot_id ASC LIMIT 1',
-                      (app_id,))
-            sr = c.fetchone()
+            cur.execute('SELECT slot_id FROM slots WHERE app_id=? AND is_active=0 ORDER BY slot_id ASC LIMIT 1',
+                        (app_id,))
+            sr = cur.fetchone()
             if not sr:
                 return None, "APP_POOL_FULL"
 
             slot_id = sr[0]
             now = datetime.now()
             end = now + timedelta(seconds=time_sec)
-            c.execute('''UPDATE slots SET key=?, device_id=?, ip=?, port=?, 
+            cur.execute('''UPDATE slots SET key=?, device_id=?, ip=?, port=?, 
                          time_sec=?, start_time=?, end_time=?, is_active=1 
                          WHERE app_id=? AND slot_id=?''',
-                      (key, device_id, ip, port, time_sec,
-                       now.strftime('%Y-%m-%d %H:%M:%S'),
-                       end.strftime('%Y-%m-%d %H:%M:%S'),
-                       app_id, slot_id))
-            conn.commit()
+                        (key, device_id, ip, port, time_sec,
+                         now.strftime('%Y-%m-%d %H:%M:%S'),
+                         end.strftime('%Y-%m-%d %H:%M:%S'),
+                         app_id, slot_id))
+            c.commit()
             return slot_id, "OK"
-        finally:
-            conn.close()
 
 
 def release_slot(slot_id, app_id):
     with db_write_lock:
         conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
+        with conn as c:
+            cur = c.cursor()
+            cur.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                          time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0 
                          WHERE app_id=? AND slot_id=?''', (app_id, slot_id))
-            conn.commit()
-        finally:
-            conn.close()
+            c.commit()
 
 
 def get_all_slots(app_id=None):
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         if app_id:
-            c.execute('SELECT slot_id, key, device_id, ip, port, time_sec, start_time, end_time, is_active '
-                      'FROM slots WHERE app_id=? ORDER BY slot_id', (app_id,))
+            cur.execute('SELECT slot_id, key, device_id, ip, port, time_sec, start_time, end_time, is_active '
+                        'FROM slots WHERE app_id=? ORDER BY slot_id', (app_id,))
         else:
-            c.execute('SELECT app_id, slot_id, key, device_id, ip, port, time_sec, start_time, end_time, is_active '
-                      'FROM slots ORDER BY app_id, slot_id')
-        return c.fetchall()
-    finally:
-        conn.close()
+            cur.execute('SELECT app_id, slot_id, key, device_id, ip, port, time_sec, start_time, end_time, is_active '
+                        'FROM slots ORDER BY app_id, slot_id')
+        return cur.fetchall()
 
 
 def get_expired_slots():
     if get_maintenance() == "on":
         return []
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute('SELECT app_id, slot_id FROM slots WHERE is_active=1 AND end_time <= ?', (now_str,))
-        return c.fetchall()
-    finally:
-        conn.close()
+        cur.execute('SELECT app_id, slot_id FROM slots WHERE is_active=1 AND end_time <= ?', (now_str,))
+        return cur.fetchall()
 
 
 def get_expired_keys():
     if get_maintenance() == "on":
         return []
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("SELECT key FROM keys WHERE expiry <= ? AND status=?", (now_str, STATUS_ACTIVE))
-        return [r[0] for r in c.fetchall()]
-    finally:
-        conn.close()
+        cur.execute("SELECT key FROM keys WHERE expiry <= ? AND status=?", (now_str, STATUS_ACTIVE))
+        return [r[0] for r in cur.fetchall()]
 
 
-def check_rate_limit(identifier, max_requests=15, window=60):
+def check_rate_limit(identifier, max_requests=30, window=60):
     if not identifier:
         return True
     now_ts = time.time()
-    if identifier not in rate_limit_store:
-        rate_limit_store[identifier] = []
-    rate_limit_store[identifier] = [t for t in rate_limit_store[identifier] if now_ts - t < window]
-    if len(rate_limit_store[identifier]) >= max_requests:
-        return False
-    rate_limit_store[identifier].append(now_ts)
+    with _rate_limit_lock:
+        if identifier not in rate_limit_store:
+            rate_limit_store[identifier] = []
+        rate_limit_store[identifier] = [t for t in rate_limit_store[identifier] if now_ts - t < window]
+        if len(rate_limit_store[identifier]) >= max_requests:
+            return False
+        rate_limit_store[identifier].append(now_ts)
     return True
 
 
-def notify_owner_dd(text):
-    """Send message to DD bot with debug logging."""
+# ═══════════════════════ DD NOTIFIER (ASYNC) ═══════════════════════
+def _send_dd_sync(text):
     url = f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": OWNER_ID, "text": text}, timeout=10)
+        r = requests.post(url, json={"chat_id": OWNER_ID, "text": text}, timeout=8)
         if r.ok:
             data = r.json()
             if data.get("ok"):
                 print(f"📤 DD sent | msg_id={data['result']['message_id']}")
-            else:
-                print(f"❌ DD rejected: {data}")
-        else:
-            print(f"❌ DD HTTP {r.status_code}: {r.text[:200]}")
+                return
+        print(f"❌ DD failed: {r.status_code} {r.text[:150]}")
     except Exception as e:
         print(f"❌ DD error: {type(e).__name__}: {e}")
+
+
+def notify_owner_dd(text):
+    """✅ NON-BLOCKING — fire and forget."""
+    try:
+        _dd_executor.submit(_send_dd_sync, text)
+    except Exception as e:
+        print(f"❌ DD submit error: {e}")
 
 
 # ═══════════════════════ STATS ═══════════════════════
 def get_db_stats():
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         stats = {}
         for pkg in APP_IDS():
             name = app_display(pkg)
 
-            c.execute("SELECT COUNT(*), SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) FROM keys WHERE app_id=?", (pkg,))
-            keys_total, keys_active = c.fetchone()
+            cur.execute("SELECT COUNT(*), SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) FROM keys WHERE app_id=?", (pkg,))
+            keys_total, keys_active = cur.fetchone()
             keys_active = keys_active or 0
             keys_total = keys_total or 0
 
-            c.execute("SELECT COUNT(*) FROM admins WHERE app_id=?", (pkg,))
-            admins = c.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM admins WHERE app_id=?", (pkg,))
+            admins = cur.fetchone()[0]
 
-            c.execute("SELECT COUNT(*) FROM resellers WHERE app_id=?", (pkg,))
-            resellers = c.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM resellers WHERE app_id=?", (pkg,))
+            resellers = cur.fetchone()[0]
 
             total_slots = get_app_slots(pkg)
-            c.execute("SELECT COUNT(*) FROM slots WHERE app_id=? AND is_active=1", (pkg,))
-            busy_slots = c.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM slots WHERE app_id=? AND is_active=1", (pkg,))
+            busy_slots = cur.fetchone()[0]
 
             rate = get_app_rate(pkg)
 
@@ -1123,14 +1171,12 @@ def get_db_stats():
                 "rate": rate,
             }
         return stats
-    finally:
-        conn.close()
 
 
 def get_all_keys_owner(app_id=None, generated_by=None):
     conn = get_conn()
-    try:
-        c = conn.cursor()
+    with conn as c:
+        cur = c.cursor()
         query = '''SELECT key, app_id, generated_by, status, expiry, max_devices, created_at
                    FROM keys WHERE 1=1'''
         params = []
@@ -1141,24 +1187,20 @@ def get_all_keys_owner(app_id=None, generated_by=None):
             query += ' AND generated_by=?'
             params.append(str(generated_by))
         query += ' ORDER BY created_at DESC LIMIT 100'
-        c.execute(query, params)
-        return c.fetchall()
-    finally:
-        conn.close()
+        cur.execute(query, params)
+        return cur.fetchall()
 
 
 def get_all_admins_grouped():
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('''SELECT a.telegram_id, a.app_id, 
+    with conn as c:
+        cur = c.cursor()
+        cur.execute('''SELECT a.telegram_id, a.app_id, 
                             COALESCE(p.can_add_admin, 0)
                      FROM admins a
                      LEFT JOIN admin_perms p ON a.telegram_id = p.telegram_id
                      ORDER BY a.app_id, a.telegram_id''')
-        return c.fetchall()
-    finally:
-        conn.close()
+        return cur.fetchall()
 
 
 # ═══════════════════════ FLASK API ═══════════════════════
@@ -1191,7 +1233,7 @@ def resolve_request_app(key, client_pkg):
         return None, "WRONG_APP"
 
     expected_prefix = app_prefix(key_app_id)
-    if not key.startswith(expected_prefix + "-"):
+    if not expected_prefix or not key.startswith(expected_prefix + "-"):
         return None, "PREFIX_MISMATCH"
 
     return key_app_id, "OK"
@@ -1209,12 +1251,12 @@ def build_slots_response(app_id):
     total = app_slots(app_id)
 
     slots = []
+    now = datetime.now()
     for r in rows:
         slot_id, key, device_id, ip, port, time_sec, start_time, end_time, is_active = r
         if is_active and end_time:
             try:
-                rem = int((datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S')
-                           - datetime.now()).total_seconds())
+                rem = int((datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S') - now).total_seconds())
             except (ValueError, TypeError):
                 rem = 0
             slots.append({"slot": slot_id, "status": "BUSY", "remaining": max(0, rem)})
@@ -1279,8 +1321,6 @@ def api_slots():
         data = request.json or {}
         client_pkg = (data.get('package') or '').strip()
 
-        print(f"🔍 /api/slots POST | package='{client_pkg}'")
-
         if not client_pkg:
             return jsonify({
                 "slots": [], "active": 0, "free": 0, "max": 0,
@@ -1289,13 +1329,11 @@ def api_slots():
 
         app_id = resolve_app(client_pkg)
         if not app_id:
-            print(f"   ❌ Unknown package. Available: {APP_IDS()}")
             return jsonify({
                 "slots": [], "active": 0, "free": 0, "max": 0,
                 "error": "UnknownPackage"
             }), 404
 
-        print(f"   ✅ Resolved → {app_id}")
         return jsonify(build_slots_response(app_id))
 
     pkg_q = (request.args.get('package') or '').strip()
@@ -1373,10 +1411,8 @@ def api_dd():
 
     app_name = app_display(pkg)
     total = app_slots(pkg)
-    rows_now = get_all_slots(pkg)
-    busy_now = sum(1 for r in rows_now if r[8] == 1)
 
-    # Message 1: Attack Info
+    # ✅ Fire-and-forget: 2 alag messages, no wait
     details = (
         f"⚡ ATTACK REQUEST\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1389,8 +1425,6 @@ def api_dd():
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
     )
     notify_owner_dd(details)
-
-    # Message 2: DD Command (ALAG)
     notify_owner_dd(f"/bgmi {ip} {port} {time_sec} {app_name}")
 
     print(f"✅ Attack: {ip}:{port} | Slot {slot_id} | {app_name} | {key}")
@@ -1405,8 +1439,6 @@ def api_dd():
         "time": time_sec,
         "end_time": end.strftime('%H:%M:%S'),
         "total_slots": total,
-        "active_slots": busy_now,
-        "free_slots": total - busy_now
     })
 
 
@@ -1421,7 +1453,7 @@ def auto_release_loop():
                 print(f"🗑️ Expired key deleted: {key}")
         except Exception as e:
             print(f"Auto-release: {e}")
-        time.sleep(5)
+        time.sleep(3)
 
 
 # ═══════════════════════ KEY BOT ═══════════════════════
@@ -2000,12 +2032,10 @@ def cmd_setslots(message):
 📊 **{new_count}** slots""", parse_mode='Markdown')
 
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT telegram_id FROM admins WHERE app_id=?", (app_id,))
-        admins = c.fetchall()
-    finally:
-        conn.close()
+    with conn as c:
+        cur = c.cursor()
+        cur.execute("SELECT telegram_id FROM admins WHERE app_id=?", (app_id,))
+        admins = cur.fetchall()
     for (tid,) in admins:
         if str(tid) != str(uid):
             try:
@@ -2767,23 +2797,28 @@ def main():
     init_db()
 
     print("=" * 60)
-    print("⚡ LIGHTNING VPS — FINAL EDITION")
+    print("⚡ LIGHTNING VPS — PRODUCTION v4")
     print("=" * 60)
     print(f"👑 Owner: {OWNER_ID}")
     print(f"📱 Apps loaded: {len(APP_IDS())}")
     print(f"🌐 API Port: {API_PORT}")
     print(f"🔒 Bypass: {BYPASS_PACKAGES if BYPASS_PACKAGES else 'NONE (all isolated)'}")
+    print(f"⚡ Pool: {POOL_SIZE} conns | Cache TTL: {CACHE_TTL}s")
     print("-" * 60)
     for pkg in APP_IDS():
         print(f"   • {app_display(pkg):12s} → {fmt_rate(get_app_rate(pkg)):>5}/hr | "
               f"slots {get_app_slots(pkg)} | prefix {app_prefix(pkg)}")
     print("=" * 60)
-    print("✅ Running...")
-    print("=" * 60)
 
+    # Background threads
     threading.Thread(target=auto_release_loop, daemon=True).start()
     threading.Thread(target=run_key_bot, daemon=True).start()
 
+    # Flask dev server — only for local dev
+    # For production, use: gunicorn -c gunicorn.conf.py lightning:app
+    print("🚀 Starting Flask dev server...")
+    print("   ⚠️ For production use gunicorn!")
+    print("=" * 60)
     app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False, threaded=True)
 
 
