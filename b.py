@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (FULLY FIXED)
+⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (FINAL)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ DYNAMIC APPS — bot se add/remove
-✅ Per-app slots — STRICT ISOLATION (no 23 aggregate)
-✅ Cross-app key block — key sirf apne app me chalegi
-✅ Decimal rates (12.5, 13.5, etc.)
-✅ Premium aesthetic UI
-✅ Maintenance mode with time freeze (keys + slots)
-✅ /extendkeys — bulk extension
+✅ Per-app slots — STRICT ISOLATION (23 kabhi nahi)
+✅ Cross-app key block — 3 layer security
+✅ DD bot: 2 alag messages (info + /bgmi command)
+✅ Dynamic apps
+✅ Decimal rates
+✅ Maintenance freeze (keys + slots)
 ✅ Multi-device keys (1-20)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -36,7 +35,7 @@ OWNER_ID = 6321758394
 API_SECRET = "RAGEBITE_SECRET_2026_CHANGE_ME"
 API_PORT = 5000
 
-BYPASS_PACKAGES = set()   # Empty = all apps isolated
+BYPASS_PACKAGES = set()
 
 _DEFAULT_APPS = {
     "com.ragebite.app":   {"name": "RageBite",  "prefix": "RAGEBITE", "default_rate": 10, "default_slots": 4},
@@ -66,7 +65,6 @@ _cache_lock = threading.RLock()
 apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 10
 
-# ═══════════════════════ APP CACHE ═══════════════════════
 _apps_cache = {}
 _name_to_pkg_cache = {}
 
@@ -108,15 +106,45 @@ def APP_IDS():
 
 
 def resolve_app(name_or_pkg):
-    """Resolve app name/package → canonical package. Strict match."""
+    """Robust resolver with aliases (.apk/.app, case, com. prefix)."""
     if not name_or_pkg:
         return None
-    s = str(name_or_pkg).strip()
+    s = str(name_or_pkg).strip().lower()
+    if not s:
+        return None
+
     with _cache_lock:
         if s in _apps_cache:
             return s
-        key = s.lower().replace(" ", "")
-        return _name_to_pkg_cache.get(key)
+
+        key = s.replace(" ", "").replace("_", "").replace("-", "")
+        if key in _name_to_pkg_cache:
+            return _name_to_pkg_cache[key]
+
+        candidates = [s]
+        if s.endswith('.apk'):
+            candidates.append(s[:-4] + '.app')
+            candidates.append(s[:-4])
+        elif s.endswith('.app'):
+            candidates.append(s[:-4] + '.apk')
+            candidates.append(s[:-4])
+        else:
+            candidates.append(s + '.app')
+            candidates.append(s + '.apk')
+
+        extra = []
+        for c in candidates:
+            if c.startswith('com.'):
+                extra.append(c[4:])
+            else:
+                extra.append('com.' + c)
+        candidates.extend(extra)
+
+        for c in candidates:
+            if c in _apps_cache:
+                return c
+
+        return None
 
 
 def app_display(pkg):
@@ -195,14 +223,12 @@ def get_app_slots(pkg):
 
 
 def set_app_slots(pkg, count):
-    """FIXED: Active slots preserved when shrinking."""
     count = max(1, min(50, int(count)))
     conn = get_conn()
     try:
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                   (f"slots:{pkg}", str(count)))
-        # Safely release active slots beyond new range
         c.execute('''UPDATE slots SET key=NULL, device_id=NULL, ip=NULL, port=NULL,
                      time_sec=NULL, start_time=NULL, end_time=NULL, is_active=0
                      WHERE app_id=? AND slot_id > ? AND is_active=1''', (pkg, count))
@@ -453,7 +479,6 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                   (f"slots:{pkg}", str(slots)))
 
-    # Cleanup invalid keys (orphan app_id or prefix mismatch)
     c.execute("SELECT key, app_id FROM keys")
     bad_keys = []
     for k, aid in c.fetchall():
@@ -836,10 +861,7 @@ def get_key_info(key):
 
 
 def verify_key_with_device(key, device_id, app_id):
-    """
-    ✅ STRICT: Key ka app_id DB wale se match hona zaroori.
-    Cross-app use BLOCK.
-    """
+    """STRICT: Cross-app block via app_id + prefix check."""
     with db_write_lock:
         conn = get_conn()
         try:
@@ -853,11 +875,9 @@ def verify_key_with_device(key, device_id, app_id):
             if not key_app_id:
                 return None, "INVALID_KEY_APP", False
 
-            # 🚨 CRITICAL: Cross-app block
             if key_app_id != app_id:
                 return None, "WRONG_APP", False
 
-            # 🚨 Prefix must match this app's prefix
             expected_prefix = app_prefix(app_id)
             if not expected_prefix or expected_prefix == "KEY":
                 return None, "UNKNOWN_APP", False
@@ -1050,13 +1070,20 @@ def check_rate_limit(identifier, max_requests=15, window=60):
 
 
 def notify_owner_dd(text):
+    """Send message to DD bot with debug logging."""
+    url = f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage",
-            json={"chat_id": OWNER_ID, "text": text},
-            timeout=5)
+        r = requests.post(url, json={"chat_id": OWNER_ID, "text": text}, timeout=10)
+        if r.ok:
+            data = r.json()
+            if data.get("ok"):
+                print(f"📤 DD sent | msg_id={data['result']['message_id']}")
+            else:
+                print(f"❌ DD rejected: {data}")
+        else:
+            print(f"❌ DD HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"❌ DM error: {e}")
+        print(f"❌ DD error: {type(e).__name__}: {e}")
 
 
 # ═══════════════════════ STATS ═══════════════════════
@@ -1134,16 +1161,6 @@ def get_all_admins_grouped():
         conn.close()
 
 
-def get_all_resellers_grouped():
-    conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT telegram_id, app_id, balance FROM resellers ORDER BY app_id, telegram_id')
-        return c.fetchall()
-    finally:
-        conn.close()
-
-
 # ═══════════════════════ FLASK API ═══════════════════════
 app = Flask(__name__)
 CORS(app)
@@ -1154,9 +1171,7 @@ def check_auth():
 
 
 def resolve_request_app(key, client_pkg):
-    """
-    ✅ STRICT: Client package + Key DB app_id + Prefix — sab match hone chahiye.
-    """
+    """STRICT: key's DB app + client package + prefix — all must match."""
     if not key:
         return None, "NO_KEY"
     if not client_pkg:
@@ -1172,11 +1187,9 @@ def resolve_request_app(key, client_pkg):
     if not client_resolved:
         return None, "UNKNOWN_PACKAGE"
 
-    # 🚨 Cross-app block
     if client_resolved != key_app_id:
         return None, "WRONG_APP"
 
-    # 🚨 Prefix check
     expected_prefix = app_prefix(key_app_id)
     if not key.startswith(expected_prefix + "-"):
         return None, "PREFIX_MISMATCH"
@@ -1185,16 +1198,10 @@ def resolve_request_app(key, client_pkg):
 
 
 def build_slots_response(app_id):
-    """
-    ✅ STRICT: app_id MANDATORY. Sirf usi app ke slots.
-    Global/aggregate kabhi nahi.
-    """
+    """STRICT: app_id MANDATORY. Only that app's slots."""
     if not app_id or app_id not in APP_IDS():
         return {
-            "slots": [],
-            "active": 0,
-            "free": 0,
-            "max": 0,
+            "slots": [], "active": 0, "free": 0, "max": 0,
             "error": "UnknownPackage"
         }
 
@@ -1264,16 +1271,15 @@ def api_verify():
 
 @app.route('/api/slots', methods=['GET', 'POST'])
 def api_slots():
-    """
-    ✅ STRICT: package MANDATORY. Sirf usi app ke slots.
-    Unknown/missing package → 400/404, kabhi aggregate nahi.
-    """
+    """STRICT: package MANDATORY. Only that app's slots."""
     if get_maintenance() == "on":
         return jsonify({"maintenance": True, "status": "MAINTENANCE"})
 
     if request.method == 'POST':
         data = request.json or {}
         client_pkg = (data.get('package') or '').strip()
+
+        print(f"🔍 /api/slots POST | package='{client_pkg}'")
 
         if not client_pkg:
             return jsonify({
@@ -1283,14 +1289,15 @@ def api_slots():
 
         app_id = resolve_app(client_pkg)
         if not app_id:
+            print(f"   ❌ Unknown package. Available: {APP_IDS()}")
             return jsonify({
                 "slots": [], "active": 0, "free": 0, "max": 0,
                 "error": "UnknownPackage"
             }), 404
 
+        print(f"   ✅ Resolved → {app_id}")
         return jsonify(build_slots_response(app_id))
 
-    # GET
     pkg_q = (request.args.get('package') or '').strip()
     if not pkg_q:
         return jsonify({
@@ -1369,6 +1376,7 @@ def api_dd():
     rows_now = get_all_slots(pkg)
     busy_now = sum(1 for r in rows_now if r[8] == 1)
 
+    # Message 1: Attack Info
     details = (
         f"⚡ ATTACK REQUEST\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1378,10 +1386,12 @@ def api_dd():
         f"⏱ Duration: {time_sec}s\n"
         f"📌 Slot: {slot_id}/{total}\n"
         f"👤 Device: {device_id[:16]}...\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
-        f"/bgmi {ip} {port} {time_sec} {app_name}"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
     )
     notify_owner_dd(details)
+
+    # Message 2: DD Command (ALAG)
+    notify_owner_dd(f"/bgmi {ip} {port} {time_sec} {app_name}")
 
     print(f"✅ Attack: {ip}:{port} | Slot {slot_id} | {app_name} | {key}")
     end = datetime.now() + timedelta(seconds=time_sec)
@@ -1432,7 +1442,6 @@ def get_role(uid):
     return "none"
 
 
-# ═══════════════════════ START ═══════════════════════
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     uid = message.from_user.id
@@ -1597,13 +1606,13 @@ def cmd_addapp(message):
     prefix = cmd[3].strip().upper()
 
     if not validate_package(pkg):
-        bot.reply_to(message, "❌ Invalid package. Lowercase, dots ok. Example: `com.ragebite.six`", parse_mode='Markdown')
+        bot.reply_to(message, "❌ Invalid package. Example: `com.ragebite.six`", parse_mode='Markdown')
         return
     if len(name) < 2 or len(name) > 30:
         bot.reply_to(message, "❌ Name must be 2-30 chars")
         return
     if not validate_prefix(prefix):
-        bot.reply_to(message, "❌ Invalid prefix. UPPERCASE A-Z 0-9 only, 2-16 chars.")
+        bot.reply_to(message, "❌ Invalid prefix. UPPERCASE A-Z 0-9 only.")
         return
     if pkg in APP_IDS():
         bot.reply_to(message, f"❌ Package `{pkg}` already exists", parse_mode='Markdown')
@@ -2758,7 +2767,7 @@ def main():
     init_db()
 
     print("=" * 60)
-    print("⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (FULLY FIXED)")
+    print("⚡ LIGHTNING VPS — FINAL EDITION")
     print("=" * 60)
     print(f"👑 Owner: {OWNER_ID}")
     print(f"📱 Apps loaded: {len(APP_IDS())}")
