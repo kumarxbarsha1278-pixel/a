@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (PRODUCTION v4)
+⚡ LIGHTNING VPS — PRODUCTION v5 (THREAD-SAFE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 File: b.py
 Run:  gunicorn -c gunicorn.conf.py b:app
@@ -9,7 +9,6 @@ Run:  gunicorn -c gunicorn.conf.py b:app
 
 import os
 import re
-import queue
 import sqlite3
 import threading
 import time
@@ -56,77 +55,54 @@ STATUS_DELETED = "DELETED"
 STATUS_DISABLED = "DISABLED"
 
 CACHE_TTL = 5
-POOL_SIZE = 20
 
 rate_limit_store = {}
 db_write_lock = threading.RLock()
 _cache_lock = threading.RLock()
 _rate_limit_lock = threading.RLock()
+_rate_slots_lock = threading.RLock()
 
 apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 10
 
 _apps_cache = {}
 _name_to_pkg_cache = {}
+_rate_cache = {}
+_slots_cache = {}
 
+# DD notification thread pool
 _dd_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
-# ═══════════════════════ CONNECTION POOL ═══════════════════════
-_conn_pool = queue.Queue(maxsize=POOL_SIZE)
-_pool_init_lock = threading.Lock()
-_pool_initialized = False
+# ═══════════════════════ THREAD-LOCAL CONNECTION ═══════════════════════
+_thread_local = threading.local()
 
 
-def _init_pool():
-    global _pool_initialized
-    with _pool_init_lock:
-        if _pool_initialized:
-            return
-        for _ in range(POOL_SIZE):
-            try:
-                conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA busy_timeout=30000")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA temp_store=MEMORY")
-                _conn_pool.put(conn)
-            except Exception as e:
-                print(f"⚠️ Pool init error: {e}")
-        _pool_initialized = True
-        print(f"✅ Connection pool initialized ({POOL_SIZE} connections)")
+def _get_thread_conn():
+    """Har thread ke liye apna persistent connection (thread-safe)."""
+    conn = getattr(_thread_local, 'conn', None)
+    if conn is None:
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        _thread_local.conn = conn
+    return conn
 
 
 class PooledConn:
+    """Thread-local connection context manager."""
     def __init__(self):
         self.conn = None
-        self._from_pool = False
 
     def __enter__(self):
-        if not _pool_initialized:
-            _init_pool()
-        try:
-            self.conn = _conn_pool.get(timeout=10)
-            self._from_pool = True
-        except queue.Empty:
-            self.conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA busy_timeout=30000")
-            self._from_pool = False
+        self.conn = _get_thread_conn()
         return self.conn
 
     def __exit__(self, *args):
-        if self.conn:
-            try:
-                if self._from_pool:
-                    _conn_pool.put_nowait(self.conn)
-                else:
-                    self.conn.close()
-            except queue.Full:
-                try:
-                    self.conn.close()
-                except Exception:
-                    pass
+        # Keep connection alive for thread reuse
+        pass
 
 
 def get_conn():
@@ -235,11 +211,6 @@ def fmt_rate(rate):
 
 
 # ═══════════════════════ RATE/SLOTS CACHE ═══════════════════════
-_rate_cache = {}
-_slots_cache = {}
-_rate_slots_lock = threading.RLock()
-
-
 def get_app_rate(pkg):
     with _rate_slots_lock:
         cached = _rate_cache.get(pkg)
@@ -448,8 +419,6 @@ def app_list_str():
 
 # ═══════════════════════ DATABASE INIT ═══════════════════════
 def init_db():
-    _init_pool()
-
     conn = get_conn()
     with conn as c:
         cur = c.cursor()
@@ -1595,9 +1564,7 @@ def cmd_addapp(message):
 
     cmd = message.text.split()
     if len(cmd) < 4:
-        bot.reply_to(message, """╔══════════════════════════════════╗
-║   🆕  ADD NEW APP                ║
-╚══════════════════════════════════╝
+        bot.reply_to(message, """🆕 **ADD NEW APP**
 
 **Usage:** `/addapp <package> <name> <prefix> [rate] [slots]`
 
@@ -1662,15 +1629,7 @@ def cmd_addapp(message):
         bot.reply_to(message, f"❌ Failed: {e}")
         return
 
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  APP ADDED SUCCESSFULLY     ║
-╚══════════════════════════════════╝
-
-📦 **Package:** `{pkg}`
-📱 **Name:** **{name}**
-🔤 **Prefix:** `{prefix}`
-💰 **Rate:** `{fmt_rate(rate)}` coins/hr
-📊 **Slots:** `{slots}`""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ **APP ADDED**\n\n📦 `{pkg}`\n📱 **{name}**\n🔤 `{prefix}`\n💰 `{fmt_rate(rate)}`/hr · 📊 `{slots}` slots", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['delapp'])
@@ -1695,19 +1654,7 @@ def cmd_delapp(message):
         telebot.types.InlineKeyboardButton("🗑️ YES, DELETE", callback_data=f"delapp_yes:{pkg}"),
         telebot.types.InlineKeyboardButton("❌ Cancel", callback_data="delapp_no")
     )
-    bot.reply_to(message, f"""⚠️ **DELETE APP CONFIRMATION**
-
-📱 **{name}**
-📦 `{pkg}`
-
-**This will delete:**
-• All keys
-• All slots
-• All admins
-• All resellers
-• All settings
-
-Confirm karo:""", reply_markup=markup, parse_mode='Markdown')
+    bot.reply_to(message, f"⚠️ **DELETE {name}?**\n\n📦 `{pkg}`\n\nAll keys, slots, admins, resellers will be deleted.", reply_markup=markup, parse_mode='Markdown')
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delapp_"))
@@ -2653,13 +2600,13 @@ def main():
     init_db()
 
     print("=" * 60)
-    print("⚡ LIGHTNING VPS — PRODUCTION v4 (b.py)")
+    print("⚡ LIGHTNING VPS — PRODUCTION v5 (THREAD-SAFE)")
     print("=" * 60)
     print(f"👑 Owner: {OWNER_ID}")
     print(f"📱 Apps loaded: {len(APP_IDS())}")
     print(f"🌐 API Port: {API_PORT}")
     print(f"🔒 Bypass: {BYPASS_PACKAGES if BYPASS_PACKAGES else 'NONE (all isolated)'}")
-    print(f"⚡ Pool: {POOL_SIZE} conns | Cache TTL: {CACHE_TTL}s")
+    print(f"⚡ Mode: Thread-local connections | Cache TTL: {CACHE_TTL}s")
     print("-" * 60)
     for pkg in APP_IDS():
         print(f"   • {app_display(pkg):12s} → {fmt_rate(get_app_rate(pkg)):>5}/hr | "
