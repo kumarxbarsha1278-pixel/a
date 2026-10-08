@@ -2,17 +2,9 @@
 """
 ⚡ LIGHTNING VPS — PREMIUM DYNAMIC EDITION (PRODUCTION v4)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Per-app slots — STRICT ISOLATION (no mix, no 23 aggregate)
-✅ Cross-app key block — 3 layer security
-✅ DD bot: 2 alag messages (async, non-blocking)
-✅ Connection pool (fast DB)
-✅ Rate/Slots cache (5 sec TTL, multi-worker safe)
-✅ Gunicorn ready (production WSGI)
-✅ Decimal rates, dynamic apps
-✅ Maintenance freeze (keys + slots)
-✅ Multi-device keys (1-20)
+File: b.py
+Run:  gunicorn -c gunicorn.conf.py b:app
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Run: gunicorn -c gunicorn.conf.py lightning:app
 """
 
 import os
@@ -63,7 +55,7 @@ STATUS_ACTIVE = "ACTIVE"
 STATUS_DELETED = "DELETED"
 STATUS_DISABLED = "DISABLED"
 
-CACHE_TTL = 5        # seconds — safe for multi-worker
+CACHE_TTL = 5
 POOL_SIZE = 20
 
 rate_limit_store = {}
@@ -77,7 +69,6 @@ apihelper.READ_TIMEOUT = 10
 _apps_cache = {}
 _name_to_pkg_cache = {}
 
-# DD notification thread pool
 _dd_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
@@ -107,7 +98,6 @@ def _init_pool():
 
 
 class PooledConn:
-    """Context manager that borrows a connection from the pool."""
     def __init__(self):
         self.conn = None
         self._from_pool = False
@@ -140,7 +130,6 @@ class PooledConn:
 
 
 def get_conn():
-    """Returns a pooled connection context manager."""
     return PooledConn()
 
 
@@ -149,24 +138,21 @@ def reload_apps_cache():
     global _apps_cache, _name_to_pkg_cache
     with _cache_lock:
         conn = get_conn()
-        try:
-            with conn as c:
-                cur = c.cursor()
-                cur.execute("SELECT package, name, prefix, default_rate, default_slots FROM apps ORDER BY name")
-                rows = cur.fetchall()
-            new_apps, new_names = {}, {}
-            for pkg, name, prefix, rate, slots in rows:
-                new_apps[pkg] = {
-                    "name": name,
-                    "prefix": prefix,
-                    "default_rate": float(rate),
-                    "default_slots": int(slots),
-                }
-                new_names[name.lower().replace(" ", "")] = pkg
-            _apps_cache = new_apps
-            _name_to_pkg_cache = new_names
-        finally:
-            pass
+        with conn as c:
+            cur = c.cursor()
+            cur.execute("SELECT package, name, prefix, default_rate, default_slots FROM apps ORDER BY name")
+            rows = cur.fetchall()
+        new_apps, new_names = {}, {}
+        for pkg, name, prefix, rate, slots in rows:
+            new_apps[pkg] = {
+                "name": name,
+                "prefix": prefix,
+                "default_rate": float(rate),
+                "default_slots": int(slots),
+            }
+            new_names[name.lower().replace(" ", "")] = pkg
+        _apps_cache = new_apps
+        _name_to_pkg_cache = new_names
 
 
 # ═══════════════════════ HELPERS ═══════════════════════
@@ -176,7 +162,6 @@ def APP_IDS():
 
 
 def resolve_app(name_or_pkg):
-    """Robust resolver with aliases (.apk/.app, case, com. prefix)."""
     if not name_or_pkg:
         return None
     s = str(name_or_pkg).strip().lower()
@@ -916,7 +901,6 @@ def get_key_info(key):
 
 
 def verify_key_with_device(key, device_id, app_id):
-    """STRICT: Cross-app block via app_id + prefix check."""
     with db_write_lock:
         conn = get_conn()
         with conn as c:
@@ -1111,7 +1095,7 @@ def check_rate_limit(identifier, max_requests=30, window=60):
     return True
 
 
-# ═══════════════════════ DD NOTIFIER (ASYNC) ═══════════════════════
+# ═══════════════════════ DD NOTIFIER ═══════════════════════
 def _send_dd_sync(text):
     url = f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage"
     try:
@@ -1127,7 +1111,6 @@ def _send_dd_sync(text):
 
 
 def notify_owner_dd(text):
-    """✅ NON-BLOCKING — fire and forget."""
     try:
         _dd_executor.submit(_send_dd_sync, text)
     except Exception as e:
@@ -1213,7 +1196,6 @@ def check_auth():
 
 
 def resolve_request_app(key, client_pkg):
-    """STRICT: key's DB app + client package + prefix — all must match."""
     if not key:
         return None, "NO_KEY"
     if not client_pkg:
@@ -1240,7 +1222,6 @@ def resolve_request_app(key, client_pkg):
 
 
 def build_slots_response(app_id):
-    """STRICT: app_id MANDATORY. Only that app's slots."""
     if not app_id or app_id not in APP_IDS():
         return {
             "slots": [], "active": 0, "free": 0, "max": 0,
@@ -1313,7 +1294,6 @@ def api_verify():
 
 @app.route('/api/slots', methods=['GET', 'POST'])
 def api_slots():
-    """STRICT: package MANDATORY. Only that app's slots."""
     if get_maintenance() == "on":
         return jsonify({"maintenance": True, "status": "MAINTENANCE"})
 
@@ -1412,7 +1392,6 @@ def api_dd():
     app_name = app_display(pkg)
     total = app_slots(pkg)
 
-    # ✅ Fire-and-forget: 2 alag messages, no wait
     details = (
         f"⚡ ATTACK REQUEST\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1623,14 +1602,7 @@ def cmd_addapp(message):
 **Usage:** `/addapp <package> <name> <prefix> [rate] [slots]`
 
 **Example:**
-`/addapp com.ragebite.six RageBiteSix RBSIX 10 4`
-
-**Rules:**
-• package → lowercase, dots ok
-• name → Display name
-• prefix → UPPERCASE, A-Z 0-9
-• rate → coins/hour (default 10)
-• slots → 1-50 (default 4)""", parse_mode='Markdown')
+`/addapp com.ragebite.six RageBiteSix RBSIX 10 4`""", parse_mode='Markdown')
         return
 
     pkg = cmd[1].strip().lower()
@@ -1698,11 +1670,7 @@ def cmd_addapp(message):
 📱 **Name:** **{name}**
 🔤 **Prefix:** `{prefix}`
 💰 **Rate:** `{fmt_rate(rate)}` coins/hr
-📊 **Slots:** `{slots}`
-
-✅ Key generation ready!
-✅ Admins can be added
-✅ Slots auto-created""", parse_mode='Markdown')
+📊 **Slots:** `{slots}`""", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['delapp'])
@@ -1728,7 +1696,6 @@ def cmd_delapp(message):
         telebot.types.InlineKeyboardButton("❌ Cancel", callback_data="delapp_no")
     )
     bot.reply_to(message, f"""⚠️ **DELETE APP CONFIRMATION**
-━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📱 **{name}**
 📦 `{pkg}`
@@ -1739,8 +1706,6 @@ def cmd_delapp(message):
 • All admins
 • All resellers
 • All settings
-
-**Yeh action undo nahi hoga!**
 
 Confirm karo:""", reply_markup=markup, parse_mode='Markdown')
 
@@ -1760,14 +1725,7 @@ def cb_delapp(call):
     name = app_display(pkg)
     try:
         remove_app_from_db(pkg)
-        bot.edit_message_text(f"""╔══════════════════════════════════╗
-║   🗑️  APP DELETED                ║
-╚══════════════════════════════════╝
-
-📱 **{name}**
-📦 `{pkg}`
-
-Sab data clean ho gaya.""", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        bot.edit_message_text(f"🗑️ Deleted: **{name}** (`{pkg}`)", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
         bot.answer_callback_query(call.id, "✅ Deleted")
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ {e}")
@@ -1785,7 +1743,7 @@ def cmd_apps(message):
         bot.reply_to(message, "ℹ️ No apps configured")
         return
 
-    r = "╔══════════════════════════════════╗\n║      📱  ALL APPS                ║\n╚══════════════════════════════════╝\n\n"
+    r = "📱 **ALL APPS**\n\n"
     for pkg, info in apps:
         rate = get_app_rate(pkg)
         slots = get_app_slots(pkg)
@@ -1835,25 +1793,10 @@ def cmd_add_admin(message):
     add_admin(telegram_id, app_id)
     name = app_display(app_id)
 
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  ADMIN ADDED                ║
-╚══════════════════════════════════╝
-
-👤 **ID:** `{telegram_id}`
-📱 **App:** **{name}**
-💰 **Rate:** `{fmt_rate(get_app_rate(app_id))}` coins/hr""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ Admin added: `{telegram_id}` → **{name}**", parse_mode='Markdown')
 
     try:
-        bot.send_message(telegram_id, f"""╔══════════════════════════════════╗
-║   ⚡  WELCOME ADMIN!            ║
-╚══════════════════════════════════╝
-
-🎉 Aapko **{name}** ka admin banaya gaya hai.
-
-💰 **Rate:** `{fmt_rate(get_app_rate(app_id))}` coins/hour
-📊 **Slots:** `{get_app_slots(app_id)}`
-
-Use `/start` to see commands.""", parse_mode='Markdown')
+        bot.send_message(telegram_id, f"🎉 Aapko **{name}** ka admin banaya gaya hai.\n\nUse `/start` to see commands.", parse_mode='Markdown')
     except Exception:
         pass
 
@@ -1880,9 +1823,9 @@ def cmd_admin_list(message):
     if not admins:
         bot.reply_to(message, "ℹ️ Koi admin nahi hai")
         return
-    r = "╔══════════════════════════════════╗\n║       👑  ADMINS LIST           ║\n╚══════════════════════════════════╝\n\n"
+    r = "👑 **ADMINS**\n\n"
     for tid, app_id in admins:
-        r += f"👤 `{tid}`\n   └─ 📱 {app_display(app_id)}\n\n"
+        r += f"👤 `{tid}` → 📱 {app_display(app_id)}\n"
     bot.reply_to(message, r, parse_mode='Markdown')
 
 
@@ -1898,7 +1841,7 @@ def cmd_adminlist2(message):
     grouped = {}
     for tid, aid, can_add in rows:
         grouped.setdefault(aid, []).append((tid, can_add))
-    r = "╔══════════════════════════════════╗\n║     📋  DETAILED ADMINS         ║\n╚══════════════════════════════════╝\n\n"
+    r = "📋 **DETAILED ADMINS**\n\n"
     for aid, admins in grouped.items():
         r += f"📱 **{app_display(aid)}** ({len(admins)})\n"
         for tid, can_add in admins:
@@ -1926,9 +1869,7 @@ def cmd_allow_admin_add(message):
     name = app_display(admin_app)
     bot.reply_to(message, f"✅ `{admin_id}` can now add admins for **{name}**.", parse_mode='Markdown')
     try:
-        bot.send_message(admin_id,
-                         f"✅ **Permission Granted**\n\nAb aap apne app **{name}** me admin add kar sakte hain.\nUse: `/addadmn <id>`",
-                         parse_mode='Markdown')
+        bot.send_message(admin_id, f"✅ Permission granted for **{name}**.", parse_mode='Markdown')
     except Exception:
         pass
 
@@ -1988,12 +1929,7 @@ def cmd_setrate(message):
         return
 
     set_app_rate(app_id, coins)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  RATE UPDATED               ║
-╚══════════════════════════════════╝
-
-📱 **{app_display(app_id)}**
-💰 **{fmt_rate(coins)}** coins/hour/key""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ **{app_display(app_id)}** → 💰 `{fmt_rate(coins)}` coins/hr", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['setslots'])
@@ -2024,12 +1960,7 @@ def cmd_setslots(message):
 
     new_count = set_app_slots(app_id, count)
     name = app_display(app_id)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  SLOTS UPDATED              ║
-╚══════════════════════════════════╝
-
-📱 **{name}**
-📊 **{new_count}** slots""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ **{name}** → 📊 `{new_count}` slots", parse_mode='Markdown')
 
     conn = get_conn()
     with conn as c:
@@ -2039,7 +1970,7 @@ def cmd_setslots(message):
     for (tid,) in admins:
         if str(tid) != str(uid):
             try:
-                bot.send_message(tid, f"⚡ **{name}** slots updated to **{new_count}** by owner.", parse_mode='Markdown')
+                bot.send_message(tid, f"⚡ **{name}** slots updated to **{new_count}**", parse_mode='Markdown')
             except Exception:
                 pass
 
@@ -2055,7 +1986,7 @@ def cmd_slotinfo(message):
         return
 
     if is_owner_user:
-        r = "╔══════════════════════════════════╗\n║     📊  PER-APP SLOTS           ║\n╚══════════════════════════════════╝\n\n"
+        r = "📊 **PER-APP SLOTS**\n\n"
         for pkg in APP_IDS():
             rows = get_all_slots(pkg)
             total = app_slots(pkg)
@@ -2073,14 +2004,7 @@ def cmd_slotinfo(message):
         rate = get_app_rate(admin_app)
         name = app_display(admin_app)
         bar = progress_bar(busy, total)
-        r = f"""╔══════════════════════════════════╗
-║     📊  SLOT INFO                ║
-╚══════════════════════════════════╝
-
-📱 **{name}**
-📊 `{bar}` {busy}/{total}
-💰 **{fmt_rate(rate)}** coins/hr"""
-        bot.reply_to(message, r, parse_mode='Markdown')
+        bot.reply_to(message, f"📱 **{name}**\n📊 `{bar}` {busy}/{total}\n💰 **{fmt_rate(rate)}** coins/hr", parse_mode='Markdown')
 
 
 # ═══════════════════════ EXTEND KEYS ═══════════════════════
@@ -2119,13 +2043,7 @@ def cmd_extendkeys(message):
         if admin_filter:
             scope += f" (admin `{admin_filter}`)"
 
-        bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  KEYS EXTENDED              ║
-╚══════════════════════════════════╝
-
-⏱ Added: **{dur_disp}**
-📱 Scope: **{scope}**
-🔑 Keys: **{count}**""", parse_mode='Markdown')
+        bot.reply_to(message, f"✅ Extended **{dur_disp}** to **{count}** keys\n📱 Scope: **{scope}**", parse_mode='Markdown')
 
     else:
         if len(cmd) < 2:
@@ -2140,13 +2058,7 @@ def cmd_extendkeys(message):
         count = extend_all_keys(dur_sec, admin_app, admin_filter)
         name = app_display(admin_app)
 
-        bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  KEYS EXTENDED              ║
-╚══════════════════════════════════╝
-
-⏱ Added: **{dur_disp}**
-📱 App: **{name}**
-🔑 Keys: **{count}**""", parse_mode='Markdown')
+        bot.reply_to(message, f"✅ Extended **{dur_disp}** to **{count}** keys\n📱 App: **{name}**", parse_mode='Markdown')
 
 
 # ═══════════════════════ GENKEY / BULKKEYS ═══════════════════════
@@ -2164,14 +2076,7 @@ def _generate_and_reply(message, app_id, dur_sec, dur_disp, devices, slots=None,
             return
         balance = get_reseller_balance(uid, app_id)
         if balance < total_needed:
-            bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ❌  INSUFFICIENT BALANCE      ║
-╚══════════════════════════════════╝
-
-💰 **Need:** `{total_needed}` coins
-💰 **You have:** `{balance}` coins
-
-📊 `{fmt_rate(hourly_rate)}` × `{hours:.2f}h` × `{devices}dev` × `{count}key`""", parse_mode='Markdown')
+            bot.reply_to(message, f"❌ **Insufficient balance**\n\n💰 Need: `{total_needed}`\n💰 Have: `{balance}`", parse_mode='Markdown')
             return
 
     new_bal = None
@@ -2195,9 +2100,7 @@ def _generate_and_reply(message, app_id, dur_sec, dur_disp, devices, slots=None,
     app_nm = app_display(app_id)
 
     if is_bulk:
-        header = f"╔══════════════════════════════════╗\n║   ⚡  {count} KEYS GENERATED        ║\n╚══════════════════════════════════╝\n\n"
-        header += f"📱 **{app_nm}**\n"
-        header += f"⏱ **{dur_disp}** · 👥 **{devices}** dev\n"
+        header = f"⚡ **{count} KEYS GENERATED**\n\n📱 **{app_nm}**\n⏱ **{dur_disp}** · 👥 **{devices}** dev\n"
         if not unlimited:
             header += f"💰 Deducted: `{total_needed}` coins\n"
         header += "\n"
@@ -2205,16 +2108,7 @@ def _generate_and_reply(message, app_id, dur_sec, dur_disp, devices, slots=None,
         bot.reply_to(message, header + body, parse_mode='Markdown')
     else:
         k, exp, sc = keys_list[0]
-        text = f"""╔══════════════════════════════════╗
-║   ⚡  KEY GENERATED              ║
-╚══════════════════════════════════╝
-
-`{k}`
-
-📱 **{app_nm}**
-⏱ **{dur_disp}**
-👥 **{devices}** device(s)
-📅 Expires: `{exp}`"""
+        text = f"⚡ **KEY GENERATED**\n\n`{k}`\n\n📱 **{app_nm}**\n⏱ **{dur_disp}**\n👥 **{devices}** device(s)\n📅 Expires: `{exp}`"
         if not unlimited:
             text += f"\n💰 Deducted: `{total_needed}` coins"
         bot.reply_to(message, text, parse_mode='Markdown')
@@ -2395,14 +2289,7 @@ def cmd_resetkey(message):
         return
 
     if reset_key(key):
-        bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  KEY RESET                  ║
-╚══════════════════════════════════╝
-
-🔑 `{key}`
-📱 **{app_display(key_app)}**
-
-Device unlocked · Slots freed""", parse_mode='Markdown')
+        bot.reply_to(message, f"✅ Reset: `{key}`\n📱 **{app_display(key_app)}**", parse_mode='Markdown')
     else:
         bot.reply_to(message, "❌ Reset failed")
 
@@ -2433,7 +2320,7 @@ def cmd_listkeys(message):
         bot.reply_to(message, "ℹ️ Koi key nahi hai")
         return
 
-    r = "╔══════════════════════════════════╗\n║       🔑  YOUR KEYS              ║\n╚══════════════════════════════════╝\n\n"
+    r = "🔑 **YOUR KEYS**\n\n"
     for k in rows[:15]:
         r += f"🔑 `{k[0]}`\n   {k[1]} · {k[2]} · {k[3]}dev\n\n"
     bot.reply_to(message, r, parse_mode='Markdown')
@@ -2461,11 +2348,11 @@ def cmd_allkeys(message):
     for k, aid, gen, status, exp, maxdev, created in rows:
         grouped.setdefault(aid, []).append((k, gen, status, exp, maxdev))
 
-    r = "╔══════════════════════════════════╗\n║       🔑  ALL KEYS               ║\n╚══════════════════════════════════╝\n\n"
+    r = "🔑 **ALL KEYS**\n\n"
     for aid, keys in grouped.items():
         r += f"📱 **{app_display(aid)}** ({len(keys)})\n"
         for k, gen, status, exp, maxdev in keys[:3]:
-            r += f"   └─ `{k}`\n      by `{gen}` · {status} · {maxdev}dev\n"
+            r += f"   └─ `{k}` · {status} · {maxdev}dev\n"
         if len(keys) > 3:
             r += f"   ... +{len(keys)-3} more\n"
         r += "\n"
@@ -2489,9 +2376,9 @@ def cmd_adminkeys(message):
     if not rows:
         bot.reply_to(message, f"ℹ️ No keys by `{admin_id}`", parse_mode='Markdown')
         return
-    r = f"╔══════════════════════════════════╗\n║  🔑  KEYS by {admin_id}          ║\n╚══════════════════════════════════╝\n\n"
+    r = f"🔑 **KEYS by {admin_id}**\n\n"
     for k, aid, gen, status, exp, maxdev, created in rows[:20]:
-        r += f"🔑 `{k}`\n  📱 {app_display(aid)} · {status} · {maxdev}dev\n  📅 {exp}\n\n"
+        r += f"🔑 `{k}`\n  📱 {app_display(aid)} · {status} · {maxdev}dev\n\n"
     if len(r) > 4000:
         r = r[:4000] + "\n\n... (truncated)"
     bot.reply_to(message, r, parse_mode='Markdown')
@@ -2511,9 +2398,9 @@ def cmd_resellerkeys(message):
     if not rows:
         bot.reply_to(message, f"ℹ️ No keys by `{rid}`", parse_mode='Markdown')
         return
-    r = f"╔══════════════════════════════════╗\n║  🔑  KEYS by RESELLER {rid}      ║\n╚══════════════════════════════════╝\n\n"
+    r = f"🔑 **KEYS by RESELLER {rid}**\n\n"
     for k, aid, gen, status, exp, maxdev, created in rows[:20]:
-        r += f"🔑 `{k}`\n  📱 {app_display(aid)} · {status} · {maxdev}dev\n  📅 {exp}\n\n"
+        r += f"🔑 `{k}`\n  📱 {app_display(aid)} · {status} · {maxdev}dev\n\n"
     if len(r) > 4000:
         r = r[:4000] + "\n\n... (truncated)"
     bot.reply_to(message, r, parse_mode='Markdown')
@@ -2526,7 +2413,7 @@ def cmd_dbstats(message):
         return
 
     stats = get_db_stats()
-    r = "╔══════════════════════════════════╗\n║     📈  DATABASE STATS          ║\n╚══════════════════════════════════╝\n\n"
+    r = "📈 **DATABASE STATS**\n\n"
 
     tot_keys = tot_active = tot_admins = tot_resellers = tot_slots = tot_busy = 0
 
@@ -2545,7 +2432,7 @@ def cmd_dbstats(message):
         tot_slots += s['slots_total']
         tot_busy += s['slots_busy']
 
-    r += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    r += "━━━━━━━━━━━━━━━━━━━━━━━\n"
     r += f"**📊 GRAND TOTALS**\n"
     r += f"   🔑 {tot_active}/{tot_keys} keys\n"
     r += f"   👤 {tot_admins} admins\n"
@@ -2581,13 +2468,7 @@ def cmd_add_reseller(message):
     app_id = admin_app if admin_app else APP_IDS()[0]
     name = app_display(app_id)
     add_reseller(rid, app_id, coins)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  RESELLER ADDED             ║
-╚══════════════════════════════════╝
-
-👤 `{rid}`
-📱 **{name}**
-💰 `{coins}` coins""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ Reseller `{rid}` added to **{name}** with `{coins}` coins", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['removereseller'])
@@ -2617,7 +2498,7 @@ def cmd_reseller_list(message):
     if not rows:
         bot.reply_to(message, f"ℹ️ No resellers for {name}")
         return
-    r = f"╔══════════════════════════════════╗\n║  🛒  RESELLERS · {name[:15]:<15}║\n╚══════════════════════════════════╝\n\n"
+    r = f"🛒 **RESELLERS · {name}**\n\n"
     for tid, bal in rows:
         r += f"👤 `{tid}` · 💰 `{bal}`\n"
     bot.reply_to(message, r, parse_mode='Markdown')
@@ -2668,13 +2549,7 @@ def cmd_add_balance(message):
 
     new_bal = add_reseller_balance(rid, app_id, amount)
     name = app_display(app_id)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  BALANCE ADDED              ║
-╚══════════════════════════════════╝
-
-👤 `{rid}`
-📱 **{name}**
-💰 `+{amount}` → `{new_bal}`""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ **{name}** → `{rid}` balance `+{amount}` = `{new_bal}`", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['removebalance'])
@@ -2724,13 +2599,7 @@ def cmd_remove_balance(message):
         bot.reply_to(message, f"❌ Insufficient balance: `{new_bal}`", parse_mode='Markdown')
         return
     name = app_display(app_id)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  BALANCE REMOVED            ║
-╚══════════════════════════════════╝
-
-👤 `{rid}`
-📱 **{name}**
-💰 `-{amount}` → `{new_bal}`""", parse_mode='Markdown')
+    bot.reply_to(message, f"✅ **{name}** → `{rid}` balance `-{amount}` = `{new_bal}`", parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['balance'])
@@ -2742,13 +2611,7 @@ def cmd_balance(message):
         return
     name = app_display(reseller_app)
     rate = get_app_rate(reseller_app)
-    bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   💰  BALANCE                    ║
-╚══════════════════════════════════╝
-
-📱 **{name}**
-💰 `{bal}` coins
-🏷 `{fmt_rate(rate)}` coins/hour/key""", parse_mode='Markdown')
+    bot.reply_to(message, f"💰 **BALANCE**\n\n📱 **{name}**\n💰 `{bal}` coins\n🏷 `{fmt_rate(rate)}` coins/hour/key", parse_mode='Markdown')
 
 
 # ═══════════════════════ MAINTENANCE ═══════════════════════
@@ -2765,20 +2628,13 @@ def cmd_maintenance(message):
     arg = cmd[1].lower()
     if arg == "on":
         set_maintenance("on")
-        bot.reply_to(message, """╔══════════════════════════════════╗
-║   🔧  MAINTENANCE: ON            ║
-╚══════════════════════════════════╝
-
-⏸ Keys & slots time frozen.
-All operations paused.""")
+        bot.reply_to(message, "🔧 **MAINTENANCE: ON**\n\n⏸ Keys & slots time frozen.")
     elif arg == "off":
         frozen = set_maintenance("off")
         frozen_str = ""
         if frozen:
             frozen_str = f"\n\n⏱ Restored: **{fmt_remaining(frozen)}**\n🔑 Keys & slots auto-extended."
-        bot.reply_to(message, f"""╔══════════════════════════════════╗
-║   ✅  MAINTENANCE: OFF           ║
-╚══════════════════════════════════╝{frozen_str}""", parse_mode='Markdown')
+        bot.reply_to(message, f"✅ **MAINTENANCE: OFF**{frozen_str}", parse_mode='Markdown')
     else:
         bot.reply_to(message, "❌ Use `on` or `off`", parse_mode='Markdown')
 
@@ -2797,7 +2653,7 @@ def main():
     init_db()
 
     print("=" * 60)
-    print("⚡ LIGHTNING VPS — PRODUCTION v4")
+    print("⚡ LIGHTNING VPS — PRODUCTION v4 (b.py)")
     print("=" * 60)
     print(f"👑 Owner: {OWNER_ID}")
     print(f"📱 Apps loaded: {len(APP_IDS())}")
@@ -2810,12 +2666,9 @@ def main():
               f"slots {get_app_slots(pkg)} | prefix {app_prefix(pkg)}")
     print("=" * 60)
 
-    # Background threads
     threading.Thread(target=auto_release_loop, daemon=True).start()
     threading.Thread(target=run_key_bot, daemon=True).start()
 
-    # Flask dev server — only for local dev
-    # For production, use: gunicorn -c gunicorn.conf.py lightning:app
     print("🚀 Starting Flask dev server...")
     print("   ⚠️ For production use gunicorn!")
     print("=" * 60)
